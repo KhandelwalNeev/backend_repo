@@ -15,6 +15,7 @@ cssselect==1.4.0
 cycler==0.12.1
 fake-useragent==2.2.0
 fonttools==4.62.1
+flask
 gitdb==4.0.12
 GitPython==3.1.46
 gunicorn
