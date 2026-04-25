@@ -30,10 +30,10 @@ def load_model():
         print("⏳ Loading ONNX model...")
         _session = rt.InferenceSession(model_path)
 
-        # get input name
         _input_name = _session.get_inputs()[0].name
 
         print("✅ ONNX model loaded")
+        print("INPUT INFO:", _session.get_inputs())
 
         _load_error = None
         return True
@@ -50,7 +50,7 @@ def get_session():
     return _session
 
 
-# ── Health check (NO model load here) ────────────────────────
+# ── Health check ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 @app.route("/health", methods=["GET"])
 def health():
@@ -72,38 +72,34 @@ def predict_price():
     if not data:
         return jsonify({"success": False, "error": "Invalid JSON"}), 400
 
-    # Required fields
-    missing = [f for f in ["region", "manufacturer", "fuel"] if not data.get(f)]
-    if missing:
-        return jsonify({"success": False, "error": f"Missing: {', '.join(missing)}"}), 400
-
-    fuel = data.get("fuel", "").lower()
-    is_electric = fuel == "electric"
-
-    # ⚠️ IMPORTANT: You must match training encoding
-    # If your pipeline used encoding → this part must match it
-
     try:
-        input_array = np.array([[
-            hash(data.get("region")) % 1000,
-            hash(data.get("manufacturer")) % 1000,
-            hash(data.get("model")) % 1000,
-            hash(fuel) % 1000,
-            0 if is_electric else _safe_num(data.get("engine_cc")),
-            _safe_num(data.get("max_power")),
-            0 if is_electric else _safe_num(data.get("cylinders")),
-            hash(data.get("transmission")) % 1000,
-            hash(data.get("body_type")) % 1000,
-            hash(data.get("drive_train")) % 1000,
-            _safe_num(data.get("seats")),
-            _safe_num(data.get("km_driven")),
-            _safe_num(data.get("age")),
-        ]], dtype=np.float32)
+        fuel = data.get("fuel", "").lower()
+        is_electric = fuel == "electric"
 
-        prediction = float(session.run(None, {_input_name: input_array})[0][0])
+        # ✅ IMPORTANT: Proper ONNX input (column-wise dictionary)
+        input_data = {
+            "region":       np.array([data.get("region", "")], dtype=object),
+            "manufacturer": np.array([data.get("manufacturer", "")], dtype=object),
+            "model":        np.array([data.get("model", "")], dtype=object),
+            "fuel":         np.array([fuel], dtype=object),
+            "engine_cc":    np.array([0 if is_electric else _safe_num(data.get("engine_cc"))], dtype=np.float32),
+            "max_power":    np.array([_safe_num(data.get("max_power"))], dtype=np.float32),
+            "cylinders":    np.array([0 if is_electric else _safe_num(data.get("cylinders"))], dtype=np.float32),
+            "transmission": np.array([data.get("transmission", "")], dtype=object),
+            "type":         np.array([data.get("body_type", "")], dtype=object),
+            "drive":        np.array([data.get("drive_train", "")], dtype=object),
+            "seats":        np.array([_safe_num(data.get("seats"))], dtype=np.float32),
+            "odometer":     np.array([_safe_num(data.get("km_driven"))], dtype=np.float32),
+            "age":          np.array([_safe_num(data.get("age"))], dtype=np.float32),
+        }
+
+        # Run inference
+        outputs = session.run(None, input_data)
+        prediction = float(outputs[0][0])
 
     except Exception as e:
-        return jsonify({"success": False, "error": f"Prediction failed: {str(e)}"}), 500
+        print("❌ Prediction error:", e)
+        return jsonify({"success": False, "error": str(e)}), 500
 
     # Confidence range
     mae   = 94338
