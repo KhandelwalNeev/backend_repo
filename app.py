@@ -1,36 +1,39 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import pandas as pd
-import joblib
+import numpy as np
+import onnxruntime as rt
 import os
-import gc
 
 app = Flask(__name__)
 CORS(app)
 
-_model = None
+_session = None
+_input_name = None
 _load_error = None
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-# ── Load model lazily ─────────────────────────────────────────
+# ── Load ONNX model lazily ───────────────────────────────────
 def load_model():
-    global _model, _load_error
+    global _session, _input_name, _load_error
 
-    if _model is not None:
+    if _session is not None:
         return True
 
     try:
-        model_path = os.path.join(BASE_DIR, "car_model.pkl")
+        model_path = os.path.join(BASE_DIR, "car_model.onnx")
 
         if not os.path.exists(model_path):
-            raise FileNotFoundError("car_model.pkl not found")
+            raise FileNotFoundError("car_model.onnx not found")
 
-        print("⏳ Loading model...")
-        _model = joblib.load(model_path)
-        gc.collect()
-        print("✅ Model loaded")
+        print("⏳ Loading ONNX model...")
+        _session = rt.InferenceSession(model_path)
+
+        # get input name
+        _input_name = _session.get_inputs()[0].name
+
+        print("✅ ONNX model loaded")
 
         _load_error = None
         return True
@@ -41,20 +44,19 @@ def load_model():
         return False
 
 
-def get_model():
+def get_session():
     if not load_model():
         return None
-    return _model
+    return _session
 
 
-# ── Health check ─────────────────────────────────────────────
+# ── Health check (NO model load here) ────────────────────────
 @app.route("/", methods=["GET"])
 @app.route("/health", methods=["GET"])
 def health():
-    load_model()
     return jsonify({
-        "status": "ok" if _model else "error",
-        "model_loaded": _model is not None,
+        "status": "ok",
+        "model_loaded": _session is not None,
         "load_error": _load_error
     })
 
@@ -62,13 +64,13 @@ def health():
 # ── Predict Price ────────────────────────────────────────────
 @app.route("/predict_price", methods=["POST"])
 def predict_price():
-    model_obj = get_model()
-    if model_obj is None:
+    session = get_session()
+    if session is None:
         return jsonify({"success": False, "error": _load_error or "Model not loaded"}), 503
 
     data = request.get_json(silent=True)
     if not data:
-        return jsonify({"success": False, "error": "Invalid or empty JSON body"}), 400
+        return jsonify({"success": False, "error": "Invalid JSON"}), 400
 
     # Required fields
     missing = [f for f in ["region", "manufacturer", "fuel"] if not data.get(f)]
@@ -78,24 +80,28 @@ def predict_price():
     fuel = data.get("fuel", "").lower()
     is_electric = fuel == "electric"
 
-    input_dict = {
-        "region":       data.get("region"),
-        "manufacturer": data.get("manufacturer"),
-        "model":        data.get("model"),
-        "fuel":         fuel,
-        "engine_cc":    0 if is_electric else _safe_num(data.get("engine_cc")),
-        "max_power":    _safe_num(data.get("max_power")),
-        "cylinders":    0 if is_electric else _safe_num(data.get("cylinders")),
-        "transmission": data.get("transmission"),
-        "type":         data.get("body_type"),
-        "drive":        data.get("drive_train"),
-        "seats":        _safe_num(data.get("seats")),
-        "odometer":     _safe_num(data.get("km_driven")),
-        "age":          _safe_num(data.get("age")),
-    }
+    # ⚠️ IMPORTANT: You must match training encoding
+    # If your pipeline used encoding → this part must match it
 
     try:
-        prediction = float(model_obj.predict(pd.DataFrame([input_dict]))[0])
+        input_array = np.array([[
+            hash(data.get("region")) % 1000,
+            hash(data.get("manufacturer")) % 1000,
+            hash(data.get("model")) % 1000,
+            hash(fuel) % 1000,
+            0 if is_electric else _safe_num(data.get("engine_cc")),
+            _safe_num(data.get("max_power")),
+            0 if is_electric else _safe_num(data.get("cylinders")),
+            hash(data.get("transmission")) % 1000,
+            hash(data.get("body_type")) % 1000,
+            hash(data.get("drive_train")) % 1000,
+            _safe_num(data.get("seats")),
+            _safe_num(data.get("km_driven")),
+            _safe_num(data.get("age")),
+        ]], dtype=np.float32)
+
+        prediction = float(session.run(None, {_input_name: input_array})[0][0])
+
     except Exception as e:
         return jsonify({"success": False, "error": f"Prediction failed: {str(e)}"}), 500
 
@@ -110,39 +116,31 @@ def predict_price():
 
     breakdown = [b for b in [
         {"l": "Base vehicle value",   "v": round(base_price),       "cls": "neu"},
-        {"l": "Mileage adjustment",   "v": round(-km_driven * 0.5), "cls": "neg" if km_driven > 0 else "neu"},
-        {"l": "Age depreciation",     "v": round(-age * 20000),     "cls": "neg" if age > 0 else "neu"},
-        {"l": "Transmission premium", "v": 15000 if data.get("transmission","").lower() == "automatic" else 0, "cls": "pos"},
-        {"l": "Fuel type adjustment", "v": 20000 if is_electric else (10000 if fuel == "hybrid" else 0), "cls": "pos"},
+        {"l": "Mileage adjustment",   "v": round(-km_driven * 0.5), "cls": "neg"},
+        {"l": "Age depreciation",     "v": round(-age * 20000),     "cls": "neg"},
     ] if b["v"] != 0]
 
     return jsonify({
         "success": True,
         "result": {
-            "price":      round(prediction),
-            "low":        round(lower),
-            "high":       round(upper),
+            "price": round(prediction),
+            "low": lower,
+            "high": upper,
             "confidence": 75,
-            "breakdown":  breakdown,
+            "breakdown": breakdown,
         },
     })
-
-
-# ── Prediction history (dummy) ───────────────────────────────
-@app.route("/predictions/history", methods=["GET"])
-def predictions_history():
-    return jsonify({"success": True, "count": 0, "predictions": []})
 
 
 # ── Helper ──────────────────────────────────────────────────
 def _safe_num(val, default=0):
     try:
         return float(val) if val not in (None, "", "null") else default
-    except (TypeError, ValueError):
+    except:
         return default
 
 
 # ── Run locally ─────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port)
